@@ -75,19 +75,8 @@ class MSISDNExtractor:
             return None
 
         try:
-            # فتح الصورة
+            # فتح الصورة (في الذاكرة فقط — لا يتم حفظ أي صورة على القرص)
             original = Image.open(BytesIO(image_bytes))
-
-            # حفظ الصورة الأصلية للفحص (debug)
-            debug_dir = os.getenv("OCR_DEBUG_DIR")
-            if debug_dir:
-                try:
-                    os.makedirs(debug_dir, exist_ok=True)
-                    save_path = os.path.join(debug_dir, "last_image.png")
-                    original.convert("RGB").save(save_path)
-                    logger.info(f"Saved incoming image for debug to {save_path}")
-                except Exception as se:
-                    logger.warning(f"Could not save debug image: {se}")
 
             # توليد عدة نسخ من الصورة (تدعم الدارك مود: نص فاتح على خلفية غامقة)
             variants = MSISDNExtractor._image_variants(original)
