@@ -3,6 +3,9 @@ import logging
 from typing import Optional, TYPE_CHECKING
 from io import BytesIO
 
+import os
+import shutil
+
 try:
     import pytesseract
     from PIL import Image
@@ -15,6 +18,33 @@ if TYPE_CHECKING:
     from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_tesseract_cmd():
+    """تحديد مسار tesseract تلقائياً (مهم على ويندوز حيث لا يكون في PATH غالباً)."""
+    if not TESSERACT_AVAILABLE:
+        return
+    # 1) متغير بيئة صريح له الأولوية (مفيد على Railway/Linux)
+    env_cmd = os.getenv("TESSERACT_CMD")
+    if env_cmd and os.path.isfile(env_cmd):
+        pytesseract.pytesseract.tesseract_cmd = env_cmd
+        return
+    # 2) موجود في PATH بالفعل (حالة Linux/Docker الطبيعية)
+    if shutil.which("tesseract"):
+        return
+    # 3) المسارات الشائعة على ويندوز
+    for candidate in (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Tesseract-OCR\tesseract.exe"),
+    ):
+        if os.path.isfile(candidate):
+            pytesseract.pytesseract.tesseract_cmd = candidate
+            return
+
+
+_configure_tesseract_cmd()
 
 
 class MSISDNExtractor:
@@ -46,64 +76,84 @@ class MSISDNExtractor:
 
         try:
             # فتح الصورة
-            image = Image.open(BytesIO(image_bytes))
+            original = Image.open(BytesIO(image_bytes))
 
-            # تطبيق preprocessing للحصول على نتائج أفضل
-            image = MSISDNExtractor._preprocess_image(image)
+            # حفظ الصورة الأصلية للفحص (debug)
+            debug_dir = os.getenv("OCR_DEBUG_DIR")
+            if debug_dir:
+                try:
+                    os.makedirs(debug_dir, exist_ok=True)
+                    save_path = os.path.join(debug_dir, "last_image.png")
+                    original.convert("RGB").save(save_path)
+                    logger.info(f"Saved incoming image for debug to {save_path}")
+                except Exception as se:
+                    logger.warning(f"Could not save debug image: {se}")
 
-            # استخراج النص من الصورة
-            extracted_text = pytesseract.image_to_string(
-                image,
-                lang="eng+ara",  # دعم الإنجليزية والعربية
-                config="--psm 6"  # معالج تلقائي للصفحات
+            # توليد عدة نسخ من الصورة (تدعم الدارك مود: نص فاتح على خلفية غامقة)
+            variants = MSISDNExtractor._image_variants(original)
+
+            # قصر القراءة على الحروف المتوقعة فقط يحسّن الدقة كثيراً
+            whitelist = "MSISDNmsisdn0123456789:= "
+            configs = (
+                f"--psm 3 -c tessedit_char_whitelist={whitelist}",
+                f"--psm 6 -c tessedit_char_whitelist={whitelist}",
             )
 
-            logger.debug(f"Extracted text: {extracted_text[:100]}")
+            best_text = ""
+            for name, img in variants:
+                for cfg in configs:
+                    try:
+                        text = pytesseract.image_to_string(img, lang="eng", config=cfg)
+                    except Exception as oe:
+                        logger.warning(f"OCR attempt {name} failed: {oe}")
+                        continue
+                    logger.info(f"OCR [{name} psm{cfg.split('--psm ')[1][0]}] -> {text!r}")
+                    if len(text.strip()) > len(best_text.strip()):
+                        best_text = text
+                    msisdn = MSISDNExtractor._parse_msisdn(text)
+                    if msisdn:
+                        logger.info(f"Successfully extracted MSISDN: {msisdn}")
+                        return msisdn
 
-            # البحث عن MSISDN
-            msisdn = MSISDNExtractor._parse_msisdn(extracted_text)
-
-            if msisdn:
-                logger.info(f"Successfully extracted MSISDN: {msisdn}")
-                return msisdn
-            else:
-                logger.debug("No valid MSISDN found in extracted text")
-                return None
+            logger.info(f"No valid MSISDN found. Best text was: {best_text!r}")
+            return None
 
         except Exception as e:
             logger.error(f"Error extracting MSISDN from image: {e}", exc_info=True)
             return None
 
     @staticmethod
-    def _preprocess_image(image: "Image.Image") -> "Image.Image":
+    def _image_variants(image: "Image.Image"):
         """
-        معالجة مسبقة للصورة لتحسين OCR.
+        توليد عدة نسخ معالَجة من الصورة لتحسين OCR.
 
-        Args:
-            image: كائن PIL Image
+        يتعامل مع صور الدارك مود (نص فاتح على خلفية غامقة) عن طريق تجربة
+        النسخة العادية والمعكوسة والثنائية (أبيض/أسود).
 
         Returns:
-            صورة معالجة
+            قائمة من (الاسم، صورة PIL)
         """
         try:
-            from PIL import ImageEnhance
+            from PIL import ImageOps
 
-            # تحويل إلى RGB إذا لزم الأمر
-            if image.mode != "RGB":
-                image = image.convert("RGB")
+            # رمادي + تكبير الدقة ×3 (حاسم لقراءة النص الصغير بدقة)
+            gray = image.convert("L")
+            w, h = gray.size
+            scale = 3 if max(w, h) < 1500 else (2 if max(w, h) < 3000 else 1)
+            if scale > 1:
+                gray = gray.resize((w * scale, h * scale), Image.LANCZOS)
 
-            # تحسين التباين
-            enhancer = ImageEnhance.Contrast(image)
-            image = enhancer.enhance(1.5)
+            auto = ImageOps.autocontrast(gray, cutoff=1)
 
-            # تحسين الحدة
-            enhancer = ImageEnhance.Sharpness(image)
-            image = enhancer.enhance(2)
+            # نسخ ثنائية بعتبات مختلفة تغطي الدارك مود والعادي
+            variants = [("auto", auto)]
+            for thr in (130, 160, 100):
+                variants.append((f"bin{thr}", auto.point(lambda p, t=thr: 255 if p > t else 0)))
 
-            return image
+            return variants
         except Exception as e:
             logger.warning(f"Image preprocessing failed: {e}")
-            return image
+            return [("original", image.convert("L"))]
 
     @staticmethod
     def _parse_msisdn(text: str) -> Optional[str]:
