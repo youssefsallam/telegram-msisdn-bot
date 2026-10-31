@@ -56,11 +56,15 @@ def _build_text(number: str, deposits: list[str]) -> str:
     return "\n".join(parts)
 
 
-def _keyboard(number: str) -> InlineKeyboardMarkup:
-    """أزرار تحت الرقم: نسخ + تسجيل إيداع."""
+def _keyboard(number: str, latest: str = "") -> InlineKeyboardMarkup:
+    """أزرار تحت الرقم: نسخ + تسجيل إيداع.
+
+    بعد تسجيل أول إيداع، يتحوّل نص زر الإيداع إلى آخر مبلغ تم إدخاله.
+    """
+    dep_label = f"💰 {latest}" if latest else "💰 تسجيل إيداع"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 نسخ الرقم", copy_text=CopyTextButton(text=number))],
-        [InlineKeyboardButton("💰 تسجيل إيداع", callback_data=f"{DEPOSIT_PREFIX}{number}")],
+        [InlineKeyboardButton(dep_label, callback_data=f"{DEPOSIT_PREFIX}{number}")],
     ])
 
 
@@ -217,22 +221,21 @@ class TelegramMSISDNBot:
                 message_id=target_id,
                 text=_build_text(number, deposits),
                 parse_mode=ParseMode.HTML,
-                reply_markup=_keyboard(number),
+                reply_markup=_keyboard(number, latest=amount),
             )
             logger.info(f"Deposit recorded for {number}: {amount}")
         except TelegramError as e:
             logger.error(f"Failed to record deposit: {e}", exc_info=False)
-            await msg.reply_text("⚠️ حصل خطأ في تسجيل الإيداع، جرّب تاني.")
-            return
         finally:
             pending.pop(msg.reply_to_message.message_id, None)
 
-        # تنظيف: نحذف رسالة الطلب لتقليل الزحام، ونؤكد التسجيل
-        try:
-            await context.bot.delete_message(chat_id=msg.chat_id, message_id=msg.reply_to_message.message_id)
-        except TelegramError:
-            pass
-        await msg.reply_text(f"✅ اتسجّل إيداع {amount} على {number}")
+        # تنظيف الزحام: نحذف رسالة الطلب ورسالة المستخدم (حذف رسالة المستخدم
+        # يتطلب أن يكون البوت أدمن في الجروب؛ في الخاص لا يمكن حذف رسائل المستخدم)
+        for mid in (msg.reply_to_message.message_id, msg.message_id):
+            try:
+                await context.bot.delete_message(chat_id=msg.chat_id, message_id=mid)
+            except TelegramError:
+                pass
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """معالج أخطاء عام يمنع توقف البوت ويسجّل الخطأ فقط."""
