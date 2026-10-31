@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import html
 import logging
+import re
 import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -49,19 +50,36 @@ def _build_text(number: str, deposits: list[str]) -> str:
     # الرقم كنص عادي — تيليجرام يحوّله لرابط أزرق قابل للنقر
     parts = [html.escape(number)]
     if deposits:
-        parts.append("💰 <b>الإيداعات:</b>")
         # كتلة كود بلغة diff: كل سطر يبدأ بـ + يظهر باللون الأخضر
         lines = "\n".join(f"+ {html.escape(d)}" for d in deposits)
         parts.append(f'<pre><code class="language-diff">{lines}</code></pre>')
     return "\n".join(parts)
 
 
-def _keyboard(number: str, latest: str = "") -> InlineKeyboardMarkup:
+def _deposit_total(deposits: list[str]) -> str:
+    """جمع مبالغ الإيداعات (الجزء الرقمي قبل الشرطة) وإرجاع الإجمالي كنص."""
+    total = 0.0
+    found = False
+    for d in deposits:
+        amount_part = d.split("—")[0]
+        digits = re.sub(r"[^\d.]", "", amount_part)
+        if digits:
+            try:
+                total += float(digits)
+                found = True
+            except ValueError:
+                pass
+    if not found:
+        return ""
+    return str(int(total)) if total == int(total) else str(total)
+
+
+def _keyboard(number: str, total: str = "") -> InlineKeyboardMarkup:
     """أزرار تحت الرقم: نسخ + تسجيل إيداع.
 
-    بعد تسجيل أول إيداع، يتحوّل نص زر الإيداع إلى آخر مبلغ تم إدخاله.
+    بعد تسجيل الإيداعات، يتحوّل نص زر الإيداع إلى إجمالي المبالغ.
     """
-    dep_label = f"💰 {latest}" if latest else "💰 تسجيل إيداع"
+    dep_label = f"💰 {total}" if total else "💰 تسجيل إيداع"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 نسخ الرقم", copy_text=CopyTextButton(text=number))],
         [InlineKeyboardButton(dep_label, callback_data=f"{DEPOSIT_PREFIX}{number}")],
@@ -221,7 +239,7 @@ class TelegramMSISDNBot:
                 message_id=target_id,
                 text=_build_text(number, deposits),
                 parse_mode=ParseMode.HTML,
-                reply_markup=_keyboard(number, latest=amount),
+                reply_markup=_keyboard(number, total=_deposit_total(deposits)),
             )
             logger.info(f"Deposit recorded for {number}: {amount}")
         except TelegramError as e:
