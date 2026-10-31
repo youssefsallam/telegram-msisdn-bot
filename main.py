@@ -50,9 +50,15 @@ def _build_text(number: str, deposits: list[str]) -> str:
     # الرقم كنص عادي — تيليجرام يحوّله لرابط أزرق قابل للنقر
     parts = [html.escape(number)]
     if deposits:
-        # كتلة كود بلغة diff: كل سطر يبدأ بـ + يظهر باللون الأخضر
-        lines = "\n".join(f"+ {html.escape(d)}" for d in deposits)
-        parts.append(f'<pre><code class="language-diff">{lines}</code></pre>')
+        # كتلة كود بلغة diff:
+        #   السطر الذي يبدأ بـ + → أخضر (إيداع موجب)
+        #   السطر الذي يبدأ بـ - → أحمر (خصم / سالب)
+        lines = []
+        for d in deposits:
+            s = html.escape(d.strip())
+            lines.append(s if s.startswith("-") else f"+ {s}")
+        block = "\n".join(lines)
+        parts.append(f'<pre><code class="language-diff">{block}</code></pre>')
     return "\n".join(parts)
 
 
@@ -62,13 +68,11 @@ def _deposit_total(deposits: list[str]) -> str:
     found = False
     for d in deposits:
         amount_part = d.split("—")[0]
-        digits = re.sub(r"[^\d.]", "", amount_part)
-        if digits:
-            try:
-                total += float(digits)
-                found = True
-            except ValueError:
-                pass
+        # رقم مع علامة سالب اختيارية (السالب ينقص من الرصيد)
+        m = re.search(r"-?\d+(?:\.\d+)?", amount_part)
+        if m:
+            total += float(m.group())
+            found = True
     if not found:
         return ""
     return str(int(total)) if total == int(total) else str(total)
@@ -80,9 +84,12 @@ def _keyboard(number: str, total: str = "") -> InlineKeyboardMarkup:
     بعد تسجيل الإيداعات، يتحوّل نص زر الإيداع إلى إجمالي المبالغ.
     """
     dep_label = f"💰 {total}" if total else "💰 تسجيل إيداع"
+    # الزرّان في صف واحد جنب بعض
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 نسخ الرقم", copy_text=CopyTextButton(text=number))],
-        [InlineKeyboardButton(dep_label, callback_data=f"{DEPOSIT_PREFIX}{number}")],
+        [
+            InlineKeyboardButton("📋 نسخ", copy_text=CopyTextButton(text=number)),
+            InlineKeyboardButton(dep_label, callback_data=f"{DEPOSIT_PREFIX}{number}"),
+        ],
     ])
 
 
@@ -99,6 +106,8 @@ def _parse_deposits(text: str, number: str = "") -> list[str]:
             entry = line.lstrip("•").strip()
         elif line.startswith("+"):
             entry = line[1:].strip()
+        elif line.startswith("-"):
+            entry = line.strip()  # نحتفظ بعلامة السالب كجزء من المبلغ
         else:
             continue
         if entry and entry != number:
