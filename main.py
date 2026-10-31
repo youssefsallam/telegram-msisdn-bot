@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
+import html
 import logging
 import sys
-from typing import Optional
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    CopyTextButton,
+    ForceReply,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 from telegram.error import TelegramError
 
 from config import TELEGRAM_BOT_TOKEN, ALLOWED_CHAT_IDS, POLLING_TIMEOUT, READ_TIMEOUT, LOG_LEVEL, PROCESSED_MESSAGES
@@ -21,6 +36,42 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+# التوقيت المحلي (القاهرة) لعرض تواريخ الإيداعات
+CAIRO_TZ = ZoneInfo("Africa/Cairo")
+
+# بادئة بيانات زر الإيداع
+DEPOSIT_PREFIX = "dep:"
+
+
+def _build_text(number: str, deposits: list[str]) -> str:
+    """بناء نص رسالة الرد: الرقم باللون الأخضر + قائمة الإيداعات."""
+    # كتلة كود بلغة diff تجعل السطر الذي يبدأ بـ + يظهر باللون الأخضر
+    code = f'<pre><code class="language-diff">+ {html.escape(number)}</code></pre>'
+    parts = [code]
+    if deposits:
+        parts.append("💰 <b>الإيداعات:</b>")
+        for d in deposits:
+            parts.append(f"• {html.escape(d)}")
+    return "\n".join(parts)
+
+
+def _keyboard(number: str) -> InlineKeyboardMarkup:
+    """أزرار تحت الرقم: نسخ + تسجيل إيداع."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 نسخ الرقم", copy_text=CopyTextButton(text=number))],
+        [InlineKeyboardButton("💰 تسجيل إيداع", callback_data=f"{DEPOSIT_PREFIX}{number}")],
+    ])
+
+
+def _parse_deposits(text: str) -> list[str]:
+    """استخراج الإيداعات الحالية من نص الرسالة (الأسطر التي تبدأ بـ •)."""
+    deposits = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith("•"):
+            deposits.append(line.lstrip("•").strip())
+    return deposits
 
 
 class TelegramMSISDNBot:
@@ -93,23 +144,89 @@ class TelegramMSISDNBot:
 
     async def _send_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE, msisdn: str) -> None:
         """
-        إرسال رسالة رد مباشرة على الصورة الأصلية.
-
-        Args:
-            update: كائن Update من Telegram
-            context: كائن Context
-            msisdn: رقم MSISDN المستخرج
+        إرسال رسالة رد مباشرة على الصورة الأصلية — بالرقم الأخضر وأزرار النسخ والإيداع.
         """
         try:
             await context.bot.send_message(
                 chat_id=update.message.chat_id,
-                text=msisdn,  # الرقم فقط، بدون نص إضافي
+                text=_build_text(msisdn, []),
                 reply_to_message_id=update.message.message_id,  # الرد على الصورة الأصلية
+                parse_mode=ParseMode.HTML,
+                reply_markup=_keyboard(msisdn),
             )
             logger.info(f"Reply sent successfully to message {update.message.message_id}")
         except TelegramError as e:
             logger.error(f"Failed to send reply: {e}", exc_info=False)
             raise
+
+    async def on_deposit_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """عند الضغط على زر «تسجيل إيداع» — نطلب من المستخدم كتابة المبلغ."""
+        query = update.callback_query
+        if not query or not query.data or not query.data.startswith(DEPOSIT_PREFIX):
+            return
+
+        number = query.data[len(DEPOSIT_PREFIX):]
+        await query.answer()
+
+        # إرسال طلب كتابة المبلغ (رد إجباري على هذه الرسالة)
+        prompt = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"💰 اكتب مبلغ الإيداع للرقم {number}\n(ردّ على هذه الرسالة بالمبلغ)",
+            reply_to_message_id=query.message.message_id,
+            reply_markup=ForceReply(selective=True),
+        )
+
+        # نحفظ مؤقتاً: هذا الطلب مرتبط برسالة الرقم والإيداعات الحالية فيها
+        pending = context.chat_data.setdefault("pending_deposits", {})
+        pending[prompt.message_id] = {
+            "target_msg": query.message.message_id,
+            "number": number,
+            "deposits": _parse_deposits(query.message.text or ""),
+        }
+
+    async def on_deposit_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """التقاط المبلغ الذي كتبه المستخدم ردًّا على طلب الإيداع، وتسجيله في الرسالة."""
+        msg = update.message
+        if not msg or not msg.text or not msg.reply_to_message:
+            return
+
+        pending = context.chat_data.get("pending_deposits", {})
+        info = pending.get(msg.reply_to_message.message_id)
+        if not info:
+            return  # ليست ردًّا على طلب إيداع — نتجاهلها
+
+        amount = msg.text.strip()
+        number = info["number"]
+        target_id = info["target_msg"]
+        now = datetime.now(CAIRO_TZ).strftime("%d/%m %H:%M")
+        deposits = info["deposits"] + [f"{amount} — {now}"]
+
+        try:
+            await context.bot.edit_message_text(
+                chat_id=msg.chat_id,
+                message_id=target_id,
+                text=_build_text(number, deposits),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_keyboard(number),
+            )
+            logger.info(f"Deposit recorded for {number}: {amount}")
+        except TelegramError as e:
+            logger.error(f"Failed to record deposit: {e}", exc_info=False)
+            await msg.reply_text("⚠️ حصل خطأ في تسجيل الإيداع، جرّب تاني.")
+            return
+        finally:
+            pending.pop(msg.reply_to_message.message_id, None)
+
+        # تنظيف: نحذف رسالة الطلب لتقليل الزحام، ونؤكد التسجيل
+        try:
+            await context.bot.delete_message(chat_id=msg.chat_id, message_id=msg.reply_to_message.message_id)
+        except TelegramError:
+            pass
+        await msg.reply_text(f"✅ اتسجّل إيداع {amount} على {number}")
+
+    async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """معالج أخطاء عام يمنع توقف البوت ويسجّل الخطأ فقط."""
+        logger.error("Exception while handling an update:", exc_info=context.error)
 
     def run(self):
         """تشغيل البوت."""
@@ -118,11 +235,17 @@ class TelegramMSISDNBot:
         # إنشاء التطبيق
         app = Application.builder().token(TELEGRAM_BOT_TOKEN).read_timeout(READ_TIMEOUT).get_updates_read_timeout(POLLING_TIMEOUT).build()
 
-        # إضافة معالج الصور
+        # معالج الصور
         app.add_handler(MessageHandler(filters.PHOTO & ~filters.FORWARDED, self.handle_photo))
+        # معالج زر الإيداع
+        app.add_handler(CallbackQueryHandler(self.on_deposit_button, pattern=f"^{DEPOSIT_PREFIX}"))
+        # معالج الرد بكتابة مبلغ الإيداع
+        app.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, self.on_deposit_amount))
+        # معالج الأخطاء العام
+        app.add_error_handler(self.on_error)
 
-        # بدء التطبيق
-        app.run_polling(allowed_updates=["message"])
+        # بدء التطبيق (نستقبل الرسائل وضغطات الأزرار)
+        app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 def main():
