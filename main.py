@@ -209,12 +209,18 @@ class TelegramMSISDNBot:
         number = query.data[len(DEPOSIT_PREFIX):]
         await query.answer()
 
+        user = query.from_user
+        # منشن للمستخدم الذي ضغط الزر — ضروري حتى يعمل ForceReply(selective) في
+        # الجروبات (تيليجرام يُظهر مربع الرد فقط لمن تم منشنه في الرسالة)
+        mention = f'<a href="tg://user?id={user.id}">{html.escape(user.first_name or "👤")}</a>'
+
         # إرسال طلب كتابة المبلغ (رد إجباري على هذه الرسالة)
         prompt = await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text=f"💰 اكتب مبلغ الإيداع للرقم {number}\n(ردّ على هذه الرسالة بالمبلغ)",
+            text=f"{mention} 💰 اكتب مبلغ الإيداع للرقم {number}\n(ردّ على هذه الرسالة بالمبلغ)",
             reply_to_message_id=query.message.message_id,
-            reply_markup=ForceReply(selective=True),
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True, input_field_placeholder="المبلغ"),
         )
 
         # نحفظ مؤقتاً: هذا الطلب مرتبط برسالة الرقم والإيداعات الحالية فيها
@@ -222,6 +228,7 @@ class TelegramMSISDNBot:
         pending[prompt.message_id] = {
             "target_msg": query.message.message_id,
             "number": number,
+            "user_id": user.id,
             "deposits": _parse_deposits(query.message.text or "", number),
         }
 
@@ -235,6 +242,10 @@ class TelegramMSISDNBot:
         info = pending.get(msg.reply_to_message.message_id)
         if not info:
             return  # ليست ردًّا على طلب إيداع — نتجاهلها
+
+        # في الجروب: نقبل الرد فقط من نفس الشخص الذي ضغط الزر
+        if info.get("user_id") and msg.from_user and msg.from_user.id != info["user_id"]:
+            return
 
         amount = msg.text.strip()
         number = info["number"]
