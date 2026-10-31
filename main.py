@@ -45,14 +45,14 @@ DEPOSIT_PREFIX = "dep:"
 
 
 def _build_text(number: str, deposits: list[str]) -> str:
-    """بناء نص رسالة الرد: الرقم باللون الأخضر + قائمة الإيداعات."""
-    # كتلة كود بلغة diff تجعل السطر الذي يبدأ بـ + يظهر باللون الأخضر
-    code = f'<pre><code class="language-diff">+ {html.escape(number)}</code></pre>'
-    parts = [code]
+    """بناء نص رسالة الرد: الرقم عادي (أزرق) + الإيداعات باللون الأخضر."""
+    # الرقم كنص عادي — تيليجرام يحوّله لرابط أزرق قابل للنقر
+    parts = [html.escape(number)]
     if deposits:
         parts.append("💰 <b>الإيداعات:</b>")
-        for d in deposits:
-            parts.append(f"• {html.escape(d)}")
+        # كتلة كود بلغة diff: كل سطر يبدأ بـ + يظهر باللون الأخضر
+        lines = "\n".join(f"+ {html.escape(d)}" for d in deposits)
+        parts.append(f'<pre><code class="language-diff">{lines}</code></pre>')
     return "\n".join(parts)
 
 
@@ -64,13 +64,23 @@ def _keyboard(number: str) -> InlineKeyboardMarkup:
     ])
 
 
-def _parse_deposits(text: str) -> list[str]:
-    """استخراج الإيداعات الحالية من نص الرسالة (الأسطر التي تبدأ بـ •)."""
+def _parse_deposits(text: str, number: str = "") -> list[str]:
+    """استخراج الإيداعات الحالية من نص الرسالة.
+
+    يدعم الصيغة الجديدة (أسطر تبدأ بـ +) والقديمة (أسطر تبدأ بـ •)،
+    مع تجاهل سطر الرقم نفسه.
+    """
     deposits = []
     for line in (text or "").splitlines():
         line = line.strip()
         if line.startswith("•"):
-            deposits.append(line.lstrip("•").strip())
+            entry = line.lstrip("•").strip()
+        elif line.startswith("+"):
+            entry = line[1:].strip()
+        else:
+            continue
+        if entry and entry != number:
+            deposits.append(entry)
     return deposits
 
 
@@ -181,7 +191,7 @@ class TelegramMSISDNBot:
         pending[prompt.message_id] = {
             "target_msg": query.message.message_id,
             "number": number,
-            "deposits": _parse_deposits(query.message.text or ""),
+            "deposits": _parse_deposits(query.message.text or "", number),
         }
 
     async def on_deposit_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
